@@ -600,9 +600,7 @@ fn verify_block_stereo_samples_iterator() {
 ///
 /// TODO: for now, it is assumes that the reader starts at a frame header;
 /// no searching for a sync code is performed at the moment.
-pub struct FrameReader<R: ReadBytes> {
-    input: R,
-}
+pub struct FrameReader;
 
 /// Either a `Block` or an `Error`.
 // TODO: The option should not be part of FrameResult.
@@ -647,14 +645,7 @@ fn ensure_buffer_len_returns_buffer_with_new_len() {
     }
 }
 
-impl<R: ReadBytes> FrameReader<R> {
-    /// Creates a new frame reader that will yield at least one element.
-    pub fn new(input: R) -> FrameReader<R> {
-        FrameReader {
-            input: input,
-        }
-    }
-
+impl FrameReader {
     /// Decodes the next frame or returns an error if the data was invalid.
     ///
     /// The buffer is moved into the returned block, so that the same buffer may
@@ -664,13 +655,13 @@ impl<R: ReadBytes> FrameReader<R> {
     /// allocated automatically.
     ///
     /// TODO: I should really be consistent with 'read' and 'decode'.
-    pub fn read_next_or_eof(&mut self, mut buffer: Vec<i32>) -> FrameResult {
+    pub fn read_next_or_eof<R: bytes::Buf>(mut frame: &mut R) -> FrameResult {
         // The frame includes a CRC-16 at the end. It can be computed
         // automatically while reading, by wrapping the input reader in a reader
         // that computes the CRC. If the stream ended before the the frame
         // header (so not in the middle of the frame header), return `None`,
         // indicating EOF.
-        let mut crc_input = Crc16Reader::new(&mut self.input);
+        let mut crc_input = Crc16Reader::new(&mut frame);
         let header = match try!(read_frame_header_or_eof(&mut crc_input)) {
             None => return Ok(None),
             Some(h) => h,
@@ -682,7 +673,7 @@ impl<R: ReadBytes> FrameReader<R> {
 
         // Ensure the buffer is the right size to hold all samples. For
         // correctness, we must be careful to overwrite each byte in the buffer.
-        buffer = ensure_buffer_len(buffer, total_samples);
+        let mut buffer = vec![0; total_samples];
 
         let bps = match header.bits_per_sample {
             Some(x) => x,
@@ -776,11 +767,6 @@ impl<R: ReadBytes> FrameReader<R> {
         let block = Block::new(time, header.block_size as u32, buffer);
 
         Ok(Some(block))
-    }
-
-    /// Destroy the frame reader, returning the wrapped reader.
-    pub fn into_inner(self) -> R {
-        self.input
     }
 }
 

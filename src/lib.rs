@@ -68,14 +68,15 @@
 
 #![warn(missing_docs)]
 
-use std::fs;
-use std::io;
-use std::mem;
-use std::path;
+
+
+
+
 use error::fmt_err;
 use frame::FrameReader;
-use input::{BufferedReader, ReadBytes};
+
 use metadata::{MetadataBlock, MetadataBlockReader, StreamInfo, VorbisComment};
+
 
 mod crc;
 mod error;
@@ -90,17 +91,17 @@ pub use frame::Block;
 /// A FLAC decoder that can decode the stream from the underlying reader.
 ///
 /// TODO: Add an example.
-pub struct FlacReader<R: io::Read> {
+pub struct FlacHeader {
     streaminfo: StreamInfo,
     vorbis_comment: Option<VorbisComment>,
-    input: FlacReaderState<BufferedReader<R>>,
+    input: FlacReaderState,
 }
 
-enum FlacReaderState<T> {
+enum FlacReaderState {
     /// When the reader is positioned at the beginning of a frame.
-    Full(T),
+    Full,
     /// When the reader might not be positioned at the beginning of a frame.
-    MetadataOnly(T),
+    MetadataOnly,
 }
 
 /// Controls what metadata `FlacReader` reads when constructed.
@@ -166,8 +167,8 @@ impl FlacReaderOptions {
 }
 
 /// An iterator that yields samples read from a `FlacReader`.
-pub struct FlacSamples<R: ReadBytes> {
-    frame_reader: FrameReader<R>,
+pub struct FlacSamples {
+    frame_reader: FrameReader,
     block: Block,
     sample: u32,
     channel: u32,
@@ -179,7 +180,7 @@ pub struct FlacSamples<R: ReadBytes> {
 
 // TODO: Add a `FlacIntoSamples`.
 
-fn read_stream_header<R: ReadBytes>(input: &mut R) -> Result<()> {
+fn read_stream_header<R: bytes::Buf>(input: &mut R) -> Result<()> {
     // A FLAC stream starts with a 32-bit header 'fLaC' (big endian).
     const FLAC_HEADER: u32 = 0x66_4c_61_43;
 
@@ -188,7 +189,7 @@ fn read_stream_header<R: ReadBytes>(input: &mut R) -> Result<()> {
     // error message if a file starts like this.
     const ID3_HEADER: u32 = 0x49_44_33_00;
 
-    let header = try!(input.read_be_u32());
+    let header = input.get_u32();
     if header != FLAC_HEADER {
         if (header & 0xff_ff_ff_00) == ID3_HEADER {
             fmt_err("stream starts with ID3 header rather than FLAC header")
@@ -200,7 +201,7 @@ fn read_stream_header<R: ReadBytes>(input: &mut R) -> Result<()> {
     }
 }
 
-impl<R: io::Read> FlacReader<R> {
+impl FlacHeader {
     /// Create a reader that reads the FLAC format.
     ///
     /// The header and metadata blocks are read immediately. Audio frames
@@ -210,8 +211,8 @@ impl<R: io::Read> FlacReader<R> {
     /// blocks, to protect against denial of service attacks where a
     /// small damaged or malicous file could cause gigabytes of memory
     /// to be allocated. `Error::Unsupported` is returned in that case.
-    pub fn new(reader: R) -> Result<FlacReader<R>> {
-        FlacReader::new_ext(reader, FlacReaderOptions::default())
+    pub fn from_header<R: bytes::Buf>(header: R) -> Result<FlacHeader> {
+        FlacHeader::from_header_ext(header, FlacReaderOptions::default())
     }
 
     /// Create a reader that reads the FLAC format, with reader options.
@@ -223,12 +224,12 @@ impl<R: io::Read> FlacReader<R> {
     /// blocks, to protect against denial of service attacks where a
     /// small damaged or malicous file could cause gigabytes of memory
     /// to be allocated. `Error::Unsupported` is returned in that case.
-    pub fn new_ext(reader: R, options: FlacReaderOptions) -> Result<FlacReader<R>> {
-        let mut buf_reader = BufferedReader::new(reader);
+    pub fn from_header_ext<R: bytes::Buf>(mut header: R, options: FlacReaderOptions) -> Result<FlacHeader> {
+        // let mut buf_reader = BufferedReader::new(reader);
         let mut opts_current = options;
 
         // A flac stream first of all starts with a stream header.
-        try!(read_stream_header(&mut buf_reader));
+        read_stream_header(&mut header)?;
 
         // Start a new scope, because the input reader must be available again
         // for the frame reader next.
@@ -236,7 +237,7 @@ impl<R: io::Read> FlacReader<R> {
             // Next are one or more metadata blocks. The flac specification
             // dictates that the streaminfo block is the first block. The metadata
             // block reader will yield at least one element, so the unwrap is safe.
-            let mut metadata_iter = MetadataBlockReader::new(&mut buf_reader);
+            let mut metadata_iter = MetadataBlockReader::new(&mut header);
             let streaminfo_block = try!(metadata_iter.next().unwrap());
             let streaminfo = match streaminfo_block {
                 MetadataBlock::StreamInfo(info) => info,
@@ -287,13 +288,13 @@ impl<R: io::Read> FlacReader<R> {
         // "full" if `metadata_only` was false: this results in more predictable
         // behavior.
         let state = if options.metadata_only {
-            FlacReaderState::MetadataOnly(buf_reader)
+            FlacReaderState::MetadataOnly
         } else {
-            FlacReaderState::Full(buf_reader)
+            FlacReaderState::Full
         };
 
         // The flac reader will contain the reader that will read frames.
-        let flac_reader = FlacReader {
+        let flac_reader = FlacHeader {
             streaminfo: streaminfo,
             vorbis_comment: vorbis_comment,
             input: state,
@@ -354,140 +355,148 @@ impl<R: io::Read> FlacReader<R> {
         }
     }
 
-    /// Returns an iterator that decodes a single frame on every iteration.
-    /// TODO: It is not an iterator.
-    ///
-    /// This is a low-level primitive that gives you control over when decoding
-    /// happens. The representation of the decoded audio is somewhat specific to
-    /// the FLAC format. For a higher-level interface, see `samples()`.
-    pub fn blocks<'r>(&'r mut self) -> FrameReader<&'r mut BufferedReader<R>> {
-        match self.input {
-            FlacReaderState::Full(ref mut inp) => FrameReader::new(inp),
-            FlacReaderState::MetadataOnly(..) =>
-                panic!("FlacReaderOptions::metadata_only must be false \
-                       to be able to use FlacReader::blocks()"),
-        }
-    }
-
-    /// Returns an iterator over all samples.
-    ///
-    /// The channel data is is interleaved. The iterator is streaming. That is,
-    /// if you call this method once, read a few samples, and call this method
-    /// again, the second iterator will not start again from the beginning of
-    /// the file. It will continue somewhere after where the first iterator
-    /// stopped, and it might skip some samples. (This is because FLAC divides
-    /// a stream into blocks, which have to be decoded entirely. If you drop the
-    /// iterator, you lose the unread samples in that block.)
-    ///
-    /// This is a user-friendly interface that trades performance for ease of
-    /// use. If performance is an issue, consider using `blocks()` instead.
-    ///
-    /// This is a high-level interface to the decoder. The cost of retrieving
-    /// the next sample can vary significantly, as sometimes a new block has to
-    /// be decoded. Additionally, there is a cost to every iteration returning a
-    /// `Result`. When a block has been decoded, iterating the samples in that
-    /// block can never fail, but a match on every sample is required
-    /// nonetheless. For more control over when decoding happens, and less error
-    /// handling overhead, use `blocks()`.
-    pub fn samples<'r>(&'r mut self) -> FlacSamples<&'r mut BufferedReader<R>> {
-        match self.input {
-            FlacReaderState::Full(ref mut inp) => {
-                FlacSamples {
-                    frame_reader: frame::FrameReader::new(inp),
-                    block: Block::empty(),
-                    sample: 0,
-                    channel: 0,
-                    has_failed: false,
-                }
-            }
-            FlacReaderState::MetadataOnly(..) => {
-                panic!("FlacReaderOptions::metadata_only must be false \
-                       to be able to use FlacReader::samples()")
-            }
-        }
-    }
-
-    /// Destroys the FLAC reader and returns the underlying reader.
-    ///
-    /// Because the reader employs buffering internally, anything in the buffer
-    /// will be lost.
-    pub fn into_inner(self) -> R {
-        match self.input {
-            FlacReaderState::Full(inp) => inp.into_inner(),
-            FlacReaderState::MetadataOnly(inp) => inp.into_inner(),
-        }
-    }
+    // / Returns an iterator that decodes a single frame on every iteration.
+    // / TODO: It is not an iterator.
+    // /
+    // / This is a low-level primitive that gives you control over when decoding
+    // / happens. The representation of the decoded audio is somewhat specific to
+    // / the FLAC format. For a higher-level interface, see `samples()`.
+    // pub fn blocks<'r>(&'r mut self) -> FrameReader<&'r mut BufferedReader<R>> {
+    //     match self.input {
+    //         FlacReaderState::Full => FrameReader::new(),
+    //         FlacReaderState::MetadataOnly =>
+    //             panic!("FlacReaderOptions::metadata_only must be false \
+    //                    to be able to use FlacReader::blocks()"),
+    //     }
+    // }
 }
 
-impl FlacReader<fs::File> {
-    /// Attempts to create a reader that reads from the specified file.
-    ///
-    /// This is a convenience constructor that opens a `File`, and constructs a
-    /// `FlacReader` from it. There is no need to wrap the file in a
-    /// `BufReader`, as the `FlacReader` employs buffering already.
-    pub fn open<P: AsRef<path::Path>>(filename: P) -> Result<FlacReader<fs::File>> {
-        let file = try!(fs::File::open(filename));
-        FlacReader::new(file)
+impl Block {
+
+    /// Returns a block from a frame
+    pub fn from_frame<R: bytes::Buf>(frame: &mut R) -> Result<Option<Block>> {
+        FrameReader::read_next_or_eof(frame)
     }
 
-    /// Attemps to create a reader that reads from the specified file.
-    ///
-    /// This is a convenience constructor that opens a `File`, and constructs a
-    /// `FlacReader` from it. There is no need to wrap the file in a
-    /// `BufReader`, as the `FlacReader` employs buffering already.
-    pub fn open_ext<P: AsRef<path::Path>>(filename: P,
-                                          options: FlacReaderOptions)
-                                          -> Result<FlacReader<fs::File>> {
-        let file = try!(fs::File::open(filename));
-        FlacReader::new_ext(file, options)
-    }
+    // / Returns an iterator over all samples.
+    // /
+    // / The channel data is is interleaved. The iterator is streaming. That is,
+    // / if you call this method once, read a few samples, and call this method
+    // / again, the second iterator will not start again from the beginning of
+    // / the file. It will continue somewhere after where the first iterator
+    // / stopped, and it might skip some samples. (This is because FLAC divides
+    // / a stream into blocks, which have to be decoded entirely. If you drop the
+    // / iterator, you lose the unread samples in that block.)
+    // /
+    // / This is a user-friendly interface that trades performance for ease of
+    // / use. If performance is an issue, consider using `blocks()` instead.
+    // /
+    // / This is a high-level interface to the decoder. The cost of retrieving
+    // / the next sample can vary significantly, as sometimes a new block has to
+    // / be decoded. Additionally, there is a cost to every iteration returning a
+    // / `Result`. When a block has been decoded, iterating the samples in that
+    // / block can never fail, but a match on every sample is required
+    // / nonetheless. For more control over when decoding happens, and less error
+    // / handling overhead, use `blocks()`.
+    // pub fn samples<'r>(&'r mut self) -> FlacSamples<&'r mut BufferedReader<R>> {
+    //     match self.input {
+    //         FlacReaderState::Full(ref mut inp) => {
+    //             FlacSamples {
+    //                 frame_reader: frame::FrameReader::new(inp),
+    //                 block: Block::empty(),
+    //                 sample: 0,
+    //                 channel: 0,
+    //                 has_failed: false,
+    //             }
+    //         }
+    //         FlacReaderState::MetadataOnly(..) => {
+    //             panic!("FlacReaderOptions::metadata_only must be false \
+    //                    to be able to use FlacReader::samples()")
+    //         }
+    //     }
+    // }
+
+    // / Destroys the FLAC reader and returns the underlying reader.
+    // /
+    // / Because the reader employs buffering internally, anything in the buffer
+    // / will be lost.
+    // pub fn into_inner(self) -> R {
+    //     match self.input {
+    //         FlacReaderState::Full(inp) => inp.into_inner(),
+    //         FlacReaderState::MetadataOnly(inp) => inp.into_inner(),
+    //     }
+    // }
 }
 
-impl<R: ReadBytes> Iterator for FlacSamples<R> {
-    type Item = Result<i32>;
+// impl FlacReader<fs::File> {
+//     /// Attempts to create a reader that reads from the specified file.
+//     ///
+//     /// This is a convenience constructor that opens a `File`, and constructs a
+//     /// `FlacReader` from it. There is no need to wrap the file in a
+//     /// `BufReader`, as the `FlacReader` employs buffering already.
+//     pub fn open<P: AsRef<path::Path>>(filename: P) -> Result<FlacReader<fs::File>> {
+//         let file = try!(fs::File::open(filename));
+//         FlacReader::new(file)
+//     }
 
-    fn next(&mut self) -> Option<Result<i32>> {
-        // If the previous read failed, end iteration.
-        if self.has_failed {
-            return None;
-        }
+//     /// Attemps to create a reader that reads from the specified file.
+//     ///
+//     /// This is a convenience constructor that opens a `File`, and constructs a
+//     /// `FlacReader` from it. There is no need to wrap the file in a
+//     /// `BufReader`, as the `FlacReader` employs buffering already.
+//     pub fn open_ext<P: AsRef<path::Path>>(filename: P,
+//                                           options: FlacReaderOptions)
+//                                           -> Result<FlacReader<fs::File>> {
+//         let file = try!(fs::File::open(filename));
+//         FlacReader::new_ext(file, options)
+//     }
+// }
 
-        // Iterate the samples channel interleaved, so first increment the
-        // channel.
-        self.channel += 1;
+// impl<R: ReadBytes> Iterator for FlacSamples<R> {
+//     type Item = Result<i32>;
 
-        // If that was the last channel, increment the sample number.
-        if self.channel >= self.block.channels() {
-            self.channel = 0;
-            self.sample += 1;
+//     fn next(&mut self) -> Option<Result<i32>> {
+//         // If the previous read failed, end iteration.
+//         if self.has_failed {
+//             return None;
+//         }
 
-            // If that was the last sample in the block, decode the next block.
-            if self.sample >= self.block.duration() {
-                self.sample = 0;
+//         // Iterate the samples channel interleaved, so first increment the
+//         // channel.
+//         self.channel += 1;
 
-                // Replace the current block with an empty one so that we may
-                // reuse the current buffer to decode again.
-                let current_block = mem::replace(&mut self.block, Block::empty());
+//         // If that was the last channel, increment the sample number.
+//         if self.channel >= self.block.channels() {
+//             self.channel = 0;
+//             self.sample += 1;
 
-                match self.frame_reader.read_next_or_eof(current_block.into_buffer()) {
-                    Ok(Some(next_block)) => {
-                        self.block = next_block;
-                    }
-                    Ok(None) => {
-                        // The stream ended with EOF.
-                        // TODO: If a number of samples was specified in the
-                        // streaminfo metadata block, verify that we did not
-                        // read more or less samples.
-                        return None;
-                    }
-                    Err(error) => {
-                        self.has_failed = true;
-                        return Some(Err(error));
-                    }
-                }
-            }
-        }
+//             // If that was the last sample in the block, decode the next block.
+//             if self.sample >= self.block.duration() {
+//                 self.sample = 0;
 
-        Some(Ok(self.block.sample(self.channel, self.sample)))
-    }
-}
+//                 // Replace the current block with an empty one so that we may
+//                 // reuse the current buffer to decode again.
+//                 let current_block = mem::replace(&mut self.block, Block::empty());
+
+//                 match self.frame_reader.read_next_or_eof(current_block.into_buffer()) {
+//                     Ok(Some(next_block)) => {
+//                         self.block = next_block;
+//                     }
+//                     Ok(None) => {
+//                         // The stream ended with EOF.
+//                         // TODO: If a number of samples was specified in the
+//                         // streaminfo metadata block, verify that we did not
+//                         // read more or less samples.
+//                         return None;
+//                     }
+//                     Err(error) => {
+//                         self.has_failed = true;
+//                         return Some(Err(error));
+//                     }
+//                 }
+//             }
+//         }
+
+//         Some(Ok(self.block.sample(self.channel, self.sample)))
+//     }
+// }

@@ -8,7 +8,7 @@
 //! The `metadata` module deals with metadata at the beginning of a FLAC stream.
 
 use error::{Error, Result, fmt_err};
-use input::ReadBytes;
+
 use std::str;
 use std::slice;
 
@@ -211,8 +211,8 @@ impl<'a> Iterator for GetTag<'a> {
 }
 
 #[inline]
-fn read_metadata_block_header<R: ReadBytes>(input: &mut R) -> Result<MetadataBlockHeader> {
-    let byte = try!(input.read_u8());
+fn read_metadata_block_header<R: bytes::Buf>(input: &mut R) -> Result<MetadataBlockHeader> {
+    let byte = input.get_u8();
 
     // The first bit specifies whether this is the last block, the next 7 bits
     // specify the type of the metadata block to follow.
@@ -220,7 +220,7 @@ fn read_metadata_block_header<R: ReadBytes>(input: &mut R) -> Result<MetadataBlo
     let block_type = byte & 0b0111_1111;
 
     // The length field is 24 bits, or 3 bytes.
-    let length = try!(input.read_be_u24());
+    let length = get_u24(input);
 
     let header = MetadataBlockHeader {
         is_last: is_last,
@@ -228,6 +228,11 @@ fn read_metadata_block_header<R: ReadBytes>(input: &mut R) -> Result<MetadataBlo
         length: length,
     };
     Ok(header)
+}
+
+#[inline]
+fn get_u24<R: bytes::Buf>(input: &mut R) -> u32 {
+    return (input.get_u8() as u32) << 12 | (input.get_u8() as u32) << 8 | (input.get_u8() as u32)
 }
 
 /// Read a single metadata block header and body from the input.
@@ -241,7 +246,7 @@ fn read_metadata_block_header<R: ReadBytes>(input: &mut R) -> Result<MetadataBlo
 /// metadata blocks including their header verbatim in packets. This function
 /// can be used to decode that raw data.
 #[inline]
-pub fn read_metadata_block_with_header<R: ReadBytes>(input: &mut R)
+pub fn read_metadata_block_with_header<R: bytes::Buf>(input: &mut R)
                                                      -> Result<MetadataBlock> {
   let header = try!(read_metadata_block_header(input));
   read_metadata_block(input, header.block_type, header.length)
@@ -258,7 +263,7 @@ pub fn read_metadata_block_with_header<R: ReadBytes>(input: &mut R)
 /// a “FLAC Specific Box” which contains the block type and the raw data. This
 /// function can be used to decode that raw data.
 #[inline]
-pub fn read_metadata_block<R: ReadBytes>(input: &mut R,
+pub fn read_metadata_block<R: bytes::Buf>(input: &mut R,
                                          block_type: u8,
                                          length: u32)
                                          -> Result<MetadataBlock> {
@@ -285,7 +290,7 @@ pub fn read_metadata_block<R: ReadBytes>(input: &mut R,
         }
         3 => {
             // TODO: implement seektable reading. For now, pretend it is padding.
-            try!(input.skip(length));
+            input.advance(length as usize);
             Ok(MetadataBlock::Padding { length: length })
         }
         4 => {
@@ -294,12 +299,12 @@ pub fn read_metadata_block<R: ReadBytes>(input: &mut R,
         }
         5 => {
             // TODO: implement CUE sheet reading. For now, pretend it is padding.
-            try!(input.skip(length));
+            input.advance(length as usize);
             Ok(MetadataBlock::Padding { length: length })
         }
         6 => {
             // TODO: implement picture reading. For now, pretend it is padding.
-            try!(input.skip(length));
+            input.advance(length as usize);
             Ok(MetadataBlock::Padding { length: length })
         }
         127 => {
@@ -312,23 +317,23 @@ pub fn read_metadata_block<R: ReadBytes>(input: &mut R,
             // one way of handling it, but maybe there should be some kind of
             // 'strict' mode (configurable at compile time?) so that this can
             // be an error if desired.
-            try!(input.skip(length));
+            input.advance(length as usize);
             Ok(MetadataBlock::Reserved)
         }
     }
 }
 
-fn read_streaminfo_block<R: ReadBytes>(input: &mut R) -> Result<StreamInfo> {
-    let min_block_size = try!(input.read_be_u16());
-    let max_block_size = try!(input.read_be_u16());
+fn read_streaminfo_block<R: bytes::Buf>(input: &mut R) -> Result<StreamInfo> {
+    let min_block_size = input.get_u16();
+    let max_block_size = input.get_u16();
 
     // The frame size fields are 24 bits, or 3 bytes.
-    let min_frame_size = try!(input.read_be_u24());
-    let max_frame_size = try!(input.read_be_u24());
+    let min_frame_size = get_u24(input);
+    let max_frame_size = get_u24(input);
 
     // Next up are 20 bits that determine the sample rate.
-    let sample_rate_msb = try!(input.read_be_u16());
-    let sample_rate_lsb = try!(input.read_u8());
+    let sample_rate_msb = input.get_u16();
+    let sample_rate_lsb = input.get_u8();
 
     // Stitch together the value from the first 16 bits,
     // and then the 4 most significant bits of the next byte.
@@ -341,19 +346,19 @@ fn read_streaminfo_block<R: ReadBytes>(input: &mut R) -> Result<StreamInfo> {
     // The final bit is the most significant of bits per sample - 1. Bits per
     // sample - 1 is 5 bits in total.
     let bps_msb = n_channels_bps & 1;
-    let bps_lsb_n_samples = try!(input.read_u8());
+    let bps_lsb_n_samples = input.get_u8();
 
     // Stitch together these values, add 1 because # - 1 is stored.
     let bits_per_sample = (bps_msb << 4 | (bps_lsb_n_samples >> 4)) + 1;
 
     // Number of samples in 36 bits, we have 4 already, 32 to go.
     let n_samples_msb = bps_lsb_n_samples & 0b0000_1111;
-    let n_samples_lsb = try!(input.read_be_u32());
+    let n_samples_lsb = input.get_u32();
     let n_samples = (n_samples_msb as u64) << 32 | n_samples_lsb as u64;
 
     // Next are 128 bits (16 bytes) of MD5 signature.
     let mut md5sum = [0u8; 16];
-    try!(input.read_into(&mut md5sum));
+    input.copy_to_slice(&mut md5sum);
 
     // Lower bounds can never be larger than upper bounds. Note that 0 indicates
     // unknown for the frame size. Also, the block size must be at least 16.
@@ -399,7 +404,7 @@ fn read_streaminfo_block<R: ReadBytes>(input: &mut R) -> Result<StreamInfo> {
     Ok(stream_info)
 }
 
-fn read_vorbis_comment_block<R: ReadBytes>(input: &mut R, length: u32) -> Result<VorbisComment> {
+fn read_vorbis_comment_block<R: bytes::Buf>(input: &mut R, length: u32) -> Result<VorbisComment> {
     if length < 8 {
         // We expect at a minimum a 32-bit vendor string length, and a 32-bit
         // comment count.
@@ -427,7 +432,7 @@ fn read_vorbis_comment_block<R: ReadBytes>(input: &mut R, length: u32) -> Result
     // The Vorbis comment block starts with a length-prefixed "vendor string".
     // It cannot be larger than the block length - 8, because there are the
     // 32-bit vendor string length, and comment count.
-    let vendor_len = try!(input.read_le_u32());
+    let vendor_len = input.get_u32_le();
     if vendor_len > length - 8 { return fmt_err("vendor string too long") }
     let mut vendor_bytes = Vec::with_capacity(vendor_len as usize);
 
@@ -435,14 +440,14 @@ fn read_vorbis_comment_block<R: ReadBytes>(input: &mut R, length: u32) -> Result
     // is not exposed. If `read_into` succeeds, it will have overwritten all
     // bytes. If not, an error is returned and the memory is never exposed.
     unsafe { vendor_bytes.set_len(vendor_len as usize); }
-    try!(input.read_into(&mut vendor_bytes));
+    input.copy_to_slice(&mut vendor_bytes);
     let vendor = try!(String::from_utf8(vendor_bytes));
 
     // Next up is the number of comments. Because every comment is at least 4
     // bytes to indicate its length, there cannot be more comments than the
     // length of the block divided by 4. This is only an upper bound to ensure
     // that we don't allocate a big vector, to protect against DoS attacks.
-    let mut comments_len = try!(input.read_le_u32());
+    let mut comments_len = input.get_u32_le();
     if comments_len >= length / 4 {
         return fmt_err("too many entries for Vorbis comment block")
     }
@@ -453,7 +458,7 @@ fn read_vorbis_comment_block<R: ReadBytes>(input: &mut R, length: u32) -> Result
     // For every comment, there is a length-prefixed string of the form
     // "NAME=value".
     while bytes_left >= 4 && comments.len() < comments_len as usize {
-        let comment_len = try!(input.read_le_u32());
+        let comment_len = input.get_u32_le();
         bytes_left -= 4;
 
         if comment_len > bytes_left {
@@ -472,7 +477,7 @@ fn read_vorbis_comment_block<R: ReadBytes>(input: &mut R, length: u32) -> Result
         // For the same reason as above, setting the length is safe here.
         let mut comment_bytes = Vec::with_capacity(comment_len as usize);
         unsafe { comment_bytes.set_len(comment_len as usize); }
-        try!(input.read_into(&mut comment_bytes));
+        input.copy_to_slice(&mut comment_bytes);
 
         bytes_left -= comment_len;
 
@@ -512,16 +517,16 @@ fn read_vorbis_comment_block<R: ReadBytes>(input: &mut R, length: u32) -> Result
     Ok(vorbis_comment)
 }
 
-fn read_padding_block<R: ReadBytes>(input: &mut R, length: u32) -> Result<()> {
+fn read_padding_block<R: bytes::Buf>(input: &mut R, length: u32) -> Result<()> {
     // The specification dictates that all bits of the padding block must be 0.
     // However, the reference implementation does not issue an error when this
     // is not the case, and frankly, when you are going to skip over these
     // bytes and do nothing with them whatsoever, why waste all those CPU
     // cycles checking that the padding is valid?
-    Ok(try!(input.skip(length)))
+    Ok(input.advance(length as usize))
 }
 
-fn read_application_block<R: ReadBytes>(input: &mut R, length: u32) -> Result<(u32, Vec<u8>)> {
+fn read_application_block<R: bytes::Buf>(input: &mut R, length: u32) -> Result<(u32, Vec<u8>)> {
     if length < 4 {
         return fmt_err("application block length must be at least 4 bytes")
     }
@@ -534,7 +539,7 @@ fn read_application_block<R: ReadBytes>(input: &mut R, length: u32) -> Result<(u
         return Err(Error::Unsupported(msg))
     }
 
-    let id = try!(input.read_be_u32());
+    let id = input.get_u32();
 
     // Four bytes of the block have been used for the ID, the rest is payload.
     // Create a vector of uninitialized memory, and read the block into it. The
@@ -543,7 +548,8 @@ fn read_application_block<R: ReadBytes>(input: &mut R, length: u32) -> Result<(u
     // exposed.
     let mut data = Vec::with_capacity(length as usize - 4);
     unsafe { data.set_len(length as usize - 4); }
-    try!(input.read_into(&mut data));
+    // Could use Bytes here instead...
+    input.copy_to_slice(&mut data);
 
     Ok((id, data))
 }
@@ -554,7 +560,7 @@ fn read_application_block<R: ReadBytes>(input: &mut R, length: u32) -> Result<(u
 /// byte of a metadata block header. This means that the iterator will yield at
 /// least a single value. If the iterator ever yields an error, then no more
 /// data will be read thereafter, and the next value will be `None`.
-pub struct MetadataBlockReader<R: ReadBytes> {
+pub struct MetadataBlockReader<R: bytes::Buf> {
     input: R,
     done: bool,
 }
@@ -562,7 +568,7 @@ pub struct MetadataBlockReader<R: ReadBytes> {
 /// Either a `MetadataBlock` or an `Error`.
 pub type MetadataBlockResult = Result<MetadataBlock>;
 
-impl<R: ReadBytes> MetadataBlockReader<R> {
+impl<R: bytes::Buf> MetadataBlockReader<R> {
     /// Creates a metadata block reader that will yield at least one element.
     pub fn new(input: R) -> MetadataBlockReader<R> {
         MetadataBlockReader {
@@ -580,7 +586,7 @@ impl<R: ReadBytes> MetadataBlockReader<R> {
     }
 }
 
-impl<R: ReadBytes> Iterator for MetadataBlockReader<R> {
+impl<R: bytes::Buf> Iterator for MetadataBlockReader<R> {
     type Item = MetadataBlockResult;
 
     #[inline]
