@@ -604,7 +604,7 @@ pub struct FrameReader;
 
 /// Either a `Block` or an `Error`.
 // TODO: The option should not be part of FrameResult.
-pub type FrameResult = Result<Option<Block>>;
+pub type FrameResult = Result<Block>;
 
 /// A function to expand the length of a buffer, or replace the buffer altogether,
 /// so it can hold at least `new_len` elements. The contents of the buffer can
@@ -663,7 +663,7 @@ impl FrameReader {
         // indicating EOF.
         let mut crc_input = Crc16Reader::new(&mut frame);
         let header = match try!(read_frame_header_or_eof(&mut crc_input)) {
-            None => return Ok(None),
+            None => return Err(Error::FormatError("Incomplete frame header")),
             Some(h) => h,
         };
 
@@ -766,7 +766,7 @@ impl FrameReader {
 
         let block = Block::new(time, header.block_size as u32, buffer);
 
-        Ok(Some(block))
+        Ok(block)
     }
 }
 

@@ -374,7 +374,7 @@ impl FlacHeader {
 impl Block {
 
     /// Returns a block from a frame
-    pub fn from_frame<R: bytes::Buf>(frame: &mut R) -> Result<Option<Block>> {
+    pub fn from_frame<R: bytes::Buf>(frame: &mut R) -> Result<Block> {
         FrameReader::read_next_or_eof(frame)
     }
 
